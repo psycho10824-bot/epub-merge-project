@@ -1,0 +1,962 @@
+# -*- coding: utf-8 -*-
+import os
+import re
+import json
+import zipfile
+import tempfile
+import shutil
+import traceback
+import xml.etree.ElementTree as ET
+import subprocess
+
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+import ttkbootstrap as tb
+
+# 드래그앤드롭(선택)
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+    DND_AVAILABLE = True
+except Exception:
+    DND_AVAILABLE = False
+
+# 사용자 홈에 저장 위치 기억 파일
+CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".epub_merge_config.json")
+
+
+# ----------------------- 정렬 유틸 (단행본 전용) -----------------------
+def _volume_sort_key_from_basename(basename: str):
+    """
+    단행본(권) 정렬 전용 키:
+      (0, 권번호, 이름)  → 숫자 권
+      (1, rank,  이름)  → 특수 권(외전/특별외전/번외/부록/증보/개정)
+      (2, 0,    이름)  → 기타
+    """
+    name = os.path.splitext(basename)[0]
+
+    # 1) '숫자부 숫자권' (예: "1부 2권") 우선 처리
+    m = re.search(r"(\d+)\s*부\s*(\d+)\s*권", name)
+    if m:
+        part = int(m.group(1))   # 부 번호
+        vol = int(m.group(2))    # 권 번호
+        return (0, part * 1000 + vol, name)
+
+    # 1-2) '숫자 권'만 있는 일반 단행본 (예: "3권")
+    m = re.search(r"(\d+)\s*권", name)
+    if m:
+        return (0, int(m.group(1)), name)
+
+    # 2) 특수 권
+    specials_order = [
+        ("외전", 1),
+        ("특별외전", 2),
+        ("번외", 3),
+        ("부록", 4),
+        ("증보", 5),
+        ("개정", 6),
+    ]
+    for token, rank in specials_order:
+        if token in name:
+            return (1, rank, name)
+
+    # 3) 숫자만 등장(백업용)
+    m2 = re.search(r"(\d+)", name)
+    if m2:
+        return (0, int(m2.group(1)), name)
+
+    # 4) 기타
+    return (2, 0, name)
+
+
+# ----------------------------- 앱 -----------------------------
+class App:
+    def __init__(self, window, dnd_enabled=False):
+        self.window = window
+        self.dnd_enabled = dnd_enabled
+
+        self.window.title("EPUB 합치기(for감자)")
+        self.window.geometry("840x700")
+        self.window.minsize(740, 700)
+
+        self.epub_paths: list[str] = []
+        self.auto_sort_var = tk.BooleanVar(value=True)
+        self.mode_var = tk.StringVar(value="serial")  # serial | volume
+        self.toc_use_titles_var = tk.BooleanVar(value=False)  # ✅ 가능하면 소제목으로 목차 만들기
+
+        # 숫자 입력(보여주기용)
+        self.serial_start_var = tk.StringVar(value="1")
+        self.serial_end_var = tk.StringVar(value="6")
+        self.volume_start_var = tk.StringVar(value="1")
+        self.volume_end_var = tk.StringVar(value="6")
+
+        # 저장 위치 복원
+        default_dir = os.getcwd()
+        if os.path.exists(CONFIG_PATH):
+            try:
+                with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+                default_dir = cfg.get("last_output_dir", default_dir)
+            except Exception:
+                pass
+        self.last_output_dir = default_dir
+
+        self._build_ui()
+        self._sync_labels()  # 초기 라벨/입력칸 텍스트 동기화
+
+    # ----------------------------- UI 빌드 -----------------------------
+    def _build_ui(self):
+        root = ttk.Frame(self.window, padding=8)
+        root.pack(fill="both", expand=True)
+
+        # 상단 탭바
+        self.tabbar = ttk.Notebook(root)
+        self.tab_serial = ttk.Frame(self.tabbar)
+        self.tab_volume = ttk.Frame(self.tabbar)
+        self.tabbar.add(self.tab_serial, text="연재본 합치기")
+        self.tabbar.add(self.tab_volume, text="단행본 합치기")
+        self.tabbar.pack(fill="x")
+        self.tabbar.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+
+        # 파일 리스트
+        file_frame = ttk.LabelFrame(root, text="병합할 EPUB 목록 (드래그 가능)")
+        file_frame.pack(fill="both", expand=False, pady=(8, 4))
+
+        list_wrap = ttk.Frame(file_frame)
+        list_wrap.pack(fill="both", expand=True, padx=4, pady=4)
+
+        self.listbox = tk.Listbox(list_wrap, height=10)
+        self.listbox.pack(side="left", fill="both", expand=True)
+        sb = ttk.Scrollbar(list_wrap, orient="vertical", command=self.listbox.yview)
+        sb.pack(side="right", fill="y")
+        self.listbox.config(yscrollcommand=sb.set)
+
+        if self.dnd_enabled:
+            try:
+                self.listbox.drop_target_register(DND_FILES)
+                self.listbox.dnd_bind("<<Drop>>", self._on_drop_files)
+            except Exception:
+                pass
+
+        # 파일 버튼들
+        btn_row = ttk.Frame(file_frame)
+        btn_row.pack(fill="x", padx=4, pady=(0, 6))
+        ttk.Button(btn_row, text="파일 추가", command=self._add_files).pack(side="left", padx=2)
+        ttk.Button(btn_row, text="선택 삭제", command=self._remove_selected).pack(side="left", padx=2)
+        ttk.Button(btn_row, text="전체 지우기", command=self._clear_all).pack(side="left", padx=2)
+        ttk.Button(btn_row, text="위로 ↑", command=self._move_up).pack(side="left", padx=2)
+        ttk.Button(btn_row, text="아래로 ↓", command=self._move_down).pack(side="left", padx=2)
+        ttk.Checkbutton(
+            btn_row,
+            text="파일 이름으로 자동 정렬",
+            variable=self.auto_sort_var,
+            command=self._maybe_resort,
+        ).pack(side="left", padx=8)
+
+        # ✅ 새 체크박스: 가능하면 소제목으로 목차 만들기
+        ttk.Checkbutton(
+            btn_row,
+            text="가능하면 소제목으로 목차 만들기",
+            variable=self.toc_use_titles_var,
+        ).pack(side="left", padx=8)
+
+        # 저장 위치
+        out_frame = ttk.LabelFrame(root, text="저장 위치")
+        out_frame.pack(fill="x", pady=6)
+        self.out_entry = ttk.Entry(out_frame)
+        self.out_entry.pack(side="left", fill="x", expand=True, padx=6, pady=6)
+        self.out_entry.insert(0, self.last_output_dir)
+        ttk.Button(out_frame, text="찾아보기", command=self._choose_outdir).pack(side="left", padx=6)
+
+        # 진행 상태
+        log_frame = ttk.LabelFrame(root, text="진행 상태")
+        log_frame.pack(fill="both", expand=True, pady=6)
+        self.log_text = tk.Text(log_frame, height=12)
+        self.log_text.pack(fill="both", expand=True)
+
+        self.progress = ttk.Progressbar(root, orient="horizontal", mode="determinate")
+        self.progress.configure(length=400)
+        self.progress.pack(fill="x", pady=6, ipady=3)
+
+        # 병합 시작 버튼
+        ttk.Button(root, text="🚀 병합 시작", command=self._start_merge).pack(fill="x", pady=(0, 6))
+
+    # -------------------------- 이벤트/동작 --------------------------
+    def _on_tab_changed(self, _evt=None):
+        idx = self.tabbar.index(self.tabbar.select())
+        new_mode = "serial" if idx == 0 else "volume"
+        self.mode_var.set(new_mode)
+        self._maybe_resort()
+
+    def _sync_labels(self):
+        # (현재 탭에 따라 라벨 바꿔주는 로직만 유지)
+        pass
+
+    # -------------------------- 병합 시작 진입점 --------------------------
+    def _start_merge(self):
+        self.progress["value"] = 0
+        self.log_text.delete("1.0", "end")
+
+        if not self.epub_paths:
+            self._log("⚠ 병합할 EPUB 파일이 없습니다.")
+            return
+
+        out_dir = self.out_entry.get().strip()
+        if not out_dir or not os.path.isdir(out_dir):
+            messagebox.showerror("오류", "유효한 저장 위치를 선택해 주세요.")
+            return
+
+        mode = self.mode_var.get()
+        self._log(f"모드: {mode} / 파일 {len(self.epub_paths)}개")
+        self._log(f"저장 위치: {out_dir}")
+
+        if mode == "serial":
+            try:
+                out_path = self._merge_serial(out_dir)
+                self.progress["value"] = 100
+                self._log("✅ 연재본 병합 완료")
+
+                if out_path and os.path.exists(out_path):
+                    try:
+                        if os.name == "nt":
+                            subprocess.Popen([
+                                "explorer",
+                                "/select,",
+                                os.path.normpath(out_path),
+                            ])
+                        else:
+                            subprocess.Popen([
+                                "xdg-open",
+                                os.path.dirname(out_path),
+                            ])
+                    except Exception:
+                        self._log("⚠ 파일 위치 열기 중 오류가 발생했습니다.")
+            except Exception as e:
+                self._log(f"❌ 오류 발생: {e}")
+                traceback.print_exc()
+        else:
+            self._log("ℹ 단행본 병합은 아직 구현되지 않았습니다. (정렬/UI만 동작)")
+            self.progress["value"] = 100
+
+    # -------------------------- 연재본 병합 로직 --------------------------
+    def _merge_serial(self, out_dir: str):
+        """
+        연재본 EPUB들을 하나로 합치고
+        chapter_001, 002 ... 로 리네임 + toc.ncx(차례) 생성.
+        - 파일명뿐 아니라 '파일 내부에 기존 목차가 있는지'도 체크하여
+          특전/외전 EPUB를 하나의 부모 항목 아래에 묶어준다.
+        """
+        # --- 0) 파일명에서 시작/끝 화수 및 제목 코어 추출 ---
+        def extract_num_for_range(name: str):
+            base = os.path.splitext(name)[0]
+            patterns = [
+                r"\((\d+)\s*~",          # (185~194화)
+                r"(\d+)\s*-\s*\d+\s*화", # 1-184화
+                r"(\d+)\s*화",           # 595화
+                r"(\d+)\s*권",           # 3권
+                r"(\d+)",                # 그냥 숫자
+            ]
+            for pat in patterns:
+                m = re.search(pat, base)
+                if m:
+                    try:
+                        return int(m.group(1))
+                    except ValueError:
+                        pass
+            return None
+
+        first_name = os.path.basename(self.epub_paths[0])
+        last_name = os.path.basename(self.epub_paths[-1])
+
+        start_no = extract_num_for_range(first_name)
+        end_no = extract_num_for_range(last_name)
+
+        # 🔹 목차용 / 파일명용 번호를 분리해서 사용
+        toc_start_no = start_no          # toc.ncx에서 증가시키며 쓰는 번호
+        range_start_no = start_no        # 최종 파일명에 들어갈 시작 화수
+
+        base_title = os.path.splitext(first_name)[0]
+        title_core = re.sub(
+            r'\s*\(?\d+[^)]*\)?\s*(화|권)?\s*(외전)?\s*$',
+            '',
+            base_title
+        ).rstrip()
+        if not title_core:
+            title_core = base_title
+
+        tmp_root = tempfile.mkdtemp(prefix="epub_merge_")
+        self._log(f"임시 작업 폴더: {tmp_root}")
+        out_path = None
+
+        try:
+            # 1) 첫 번째 EPUB를 베이스로 추출
+            base_epub = self.epub_paths[0]
+            self._log(f"1/3: 베이스 EPUB 추출: {os.path.basename(base_epub)}")
+            base_dir = self._extract_epub_to(tmp_root, base_epub)
+
+            base_opf = self._find_opf_path(base_dir)
+            if not base_opf:
+                raise RuntimeError("베이스 EPUB에서 content.opf를 찾을 수 없습니다.")
+            self._log(f"베이스 OPF: {os.path.relpath(base_opf, base_dir)}")
+
+            tree = ET.parse(base_opf)
+            root = tree.getroot()
+            ns_uri = root.tag.split("}")[0].strip("{")
+            ns = {"opf": ns_uri}
+
+            manifest = root.find("opf:manifest", ns)
+            spine = root.find("opf:spine", ns)
+            if manifest is None or spine is None:
+                raise RuntimeError("베이스 EPUB의 manifest 또는 spine을 찾을 수 없습니다.")
+
+            # --- 1) 베이스 EPUB의 텍스트 디렉터리/아이템 맵 파악 ---
+            text_dir = ""
+            id_to_item = {}
+            for item in manifest.findall("opf:item", ns):
+                item_id = item.get("id", "")
+                href = item.get("href", "")
+                media = item.get("media-type", "")
+                id_to_item[item_id] = item
+                if not text_dir and "html" in media:
+                    text_dir = os.path.dirname(href)
+
+            if not text_dir:
+                text_dir = ""
+            self._log(f"본문 디렉터리 추정: '{text_dir or '(루트)'}'")
+
+            base_opf_dir = os.path.dirname(base_opf)
+            full_text_dir = os.path.join(base_opf_dir, text_dir) if text_dir else base_opf_dir
+            os.makedirs(full_text_dir, exist_ok=True)
+
+            # --- 2) 베이스 EPUB의 spine 텍스트를 chapter_001... 로 리네임 ---
+            used_ids = {it.get("id", "") for it in manifest.findall("opf:item", ns)}
+            old_to_new_id: dict[str, str] = {}
+            base_chapter_count = 0
+
+            for itemref in list(spine.findall("opf:itemref", ns)):
+                idref = itemref.get("idref", "")
+                item = id_to_item.get(idref)
+                if item is None:
+                    continue
+
+                media = item.get("media-type", "")
+                href = item.get("href", "")
+                if "html" not in media:
+                    continue
+
+                lower_href = href.lower()
+                if any(key in lower_href for key in ["cover", "nav", "toc", "ncx"]):
+                    continue
+
+                base_chapter_count += 1
+
+                new_id = f"chap_{base_chapter_count:03d}"
+                while new_id in used_ids:
+                    base_chapter_count += 1
+                    new_id = f"chap_{base_chapter_count:03d}"
+                used_ids.add(new_id)
+
+                fname = f"chapter_{base_chapter_count:03d}.xhtml"
+                if text_dir:
+                    new_href = f"{text_dir}/{fname}"
+                else:
+                    new_href = fname
+
+                old_full = os.path.join(base_opf_dir, href.replace("/", os.sep))
+                new_full = os.path.join(base_opf_dir, new_href.replace("/", os.sep))
+                os.makedirs(os.path.dirname(new_full), exist_ok=True)
+                try:
+                    if os.path.abspath(old_full) != os.path.abspath(new_full) and os.path.exists(old_full):
+                        os.replace(old_full, new_full)
+                except Exception:
+                    pass
+
+                item.set("id", new_id)
+                item.set("href", new_href)
+                old_to_new_id[idref] = new_id
+
+                self._log(f"  🔁 기본 본문 리네임: {href} → {new_href}")
+
+            for itemref in spine.findall("opf:itemref", ns):
+                idref = itemref.get("idref", "")
+                if idref in old_to_new_id:
+                    itemref.set("idref", old_to_new_id[idref])
+
+            used_ids = {it.get("id", "") for it in manifest.findall("opf:item", ns)}
+
+            # 🔹 EPUB(파일)별로 chapter 범위를 기록해서
+            #    나중에 특전/외전 파일을 한 묶음으로 보여줄 때 사용
+            epub_groups = []
+            epub_groups.append({
+                "index": 0,                 # 첫 번째 EPUB (베이스)
+                "start": 1,
+                "end": base_chapter_count,
+                "is_special": False,
+                "title": title_core,        # 시리즈 기본 제목
+            })
+
+            # 베이스에서 사용한 chapter 번호 다음부터 시작
+            chapter_index = base_chapter_count + 1
+
+            # --- 3) 나머지 EPUB에서 본문을 가져와서 차례대로 뒤에 붙이기 ---
+            for idx, epub_path in enumerate(self.epub_paths[1:], start=2):
+                self._log(f"2/3: 추가 EPUB #{idx} 처리 중: {os.path.basename(epub_path)}")
+                src_dir = self._extract_epub_to(tmp_root, epub_path)
+                src_opf = self._find_opf_path(src_dir)
+                if not src_opf:
+                    self._log("  ⚠ OPF를 찾지 못해 건너뜁니다.")
+                    continue
+
+                # 이 EPUB에서 생성될 chapter_XXX 범위 시작
+                group_start = chapter_index
+
+                start_ref = [chapter_index]
+                self._append_serial_chapters_from_epub(
+                    src_opf,
+                    base_opf_dir,
+                    text_dir,
+                    manifest,
+                    spine,
+                    ns,
+                    used_ids,
+                    start_index_ref=start_ref,
+                )
+                chapter_index = start_ref[0]
+
+                # 이 EPUB에서 실제로 추가된 chapter 범위
+                group_end = chapter_index - 1
+                if group_end >= group_start:
+                    base_epub_name = os.path.basename(epub_path)
+                    title_epub = os.path.splitext(base_epub_name)[0]
+
+
+                    is_special_name = False
+                    # 🔹 파일 안에 자체 toc.ncx(navPoint 2개 이상)가 있으면 특전 후보
+                    has_internal_toc = self._epub_has_multi_nav(src_opf)
+
+                    # 🔹 "이름으로 특전" 이거나 "내부 목차 있는 EPUB" 이고
+                    #    chapter가 2개 이상인 경우만 묶음 처리
+                    is_special_group = has_internal_toc and (group_end > group_start)
+
+                    epub_groups.append({
+                        "index": idx - 1,          # 0: 첫 EPUB, 1: 두 번째 EPUB ...
+                        "start": group_start,
+                        "end": group_end,
+                        "is_special": is_special_group,
+                        "title": title_epub,
+                    })
+
+            # --- 4) toc.ncx 생성 또는 갱신 ---
+            opf_dir = os.path.dirname(base_opf)
+            ncx_path = None
+
+            for item in manifest.findall("opf:item", ns):
+                if (item.get("media-type") or "").lower() == "application/x-dtbncx+xml":
+                    ncx_path = os.path.join(opf_dir, item.get("href").replace("/", os.sep))
+                    break
+
+            if not ncx_path:
+                ncx_path = os.path.join(opf_dir, "toc.ncx")
+                ET.SubElement(
+                    manifest,
+                    f"{{{ns['opf']}}}item",
+                    {
+                        "id": "ncx",
+                        "href": "toc.ncx",
+                        "media-type": "application/x-dtbncx+xml",
+                    },
+                )
+
+            spine.set("toc", "ncx")
+
+            # ncx 파일 구성
+            ncx_root = ET.Element("ncx", {
+                "xmlns": "http://www.daisy.org/z3986/2005/ncx/",
+                "version": "2005-1",
+            })
+
+            head = ET.SubElement(ncx_root, "head")
+            ET.SubElement(head, "meta", {"name": "dtb:uid", "content": "merge-uid"})
+            ET.SubElement(head, "meta", {"name": "dtb:depth", "content": "1"})
+            ET.SubElement(head, "meta", {"name": "dtb:totalPageCount", "content": "0"})
+            ET.SubElement(head, "meta", {"name": "dtb:maxPageNumber", "content": "0"})
+
+            docTitle = ET.SubElement(ncx_root, "docTitle")
+            ET.SubElement(docTitle, "text").text = title_core
+
+            navMap = ET.SubElement(ncx_root, "navMap")
+
+            play_order = 1
+            use_titles = self.toc_use_titles_var.get()
+            episode_no = toc_start_no  # 🔹 목차용 번호 (파일명용과 분리)
+
+            # chapter_001, chapter_002 ... 순서를 세기 위한 카운터
+            chapter_counter = 0
+
+            # 특전/외전 EPUB마다 부모 navPoint를 저장
+            group_parents = {}
+
+            def find_group_for_chapter(ch_index: int):
+                """해당 chapter 번호가 속한 특전/외전 EPUB 그룹을 찾음."""
+                for g in epub_groups:
+                    if g.get("is_special") and g["start"] <= ch_index <= g["end"]:
+                        return g
+                return None
+
+            for itemref in spine.findall("opf:itemref", ns):
+                idref = itemref.get("idref")
+                item = manifest.find(f"opf:item[@id='{idref}']", ns)
+                if item is None:
+                    continue
+
+                href = item.get("href") or ""
+                if not href:
+                    continue
+
+                href_norm = href.replace("\\", "/")
+                full_path = os.path.join(opf_dir, href_norm.replace("/", os.sep))
+                media = item.get("media-type", "") or ""
+                lower_href = href_norm.lower()
+
+                # --- ① 표지/본문 판별 ---
+                is_cover = (
+                    "cover" in lower_href
+                    and "html" in media
+                )
+                is_main_html = (
+                    "html" in media
+                    and not any(key in lower_href for key in ["cover", "nav", "toc", "ncx"])
+                )
+
+                if is_cover:
+                    # 표지는 항상 최상위에 '표지'로 한 줄
+                    label = "표지"
+                    parent_navmap = navMap
+
+                elif is_main_html:
+                    # nav/toc 파일은 부모 navPoint 안에 들어가면 안 됨 → 완전 제외
+                    # 차례 / 목차 / table of contents 파일은 완전히 제외
+                    toc_block_keywords = [
+                        "nav.xhtml", "toc", "table", "book_table",
+                        "contents", "content", "목차", "차례"
+                    ]
+                    if any(key in lower_href for key in toc_block_keywords):
+                        continue
+
+                    # 본문 chapter
+                    chapter_counter += 1
+                    group = find_group_for_chapter(chapter_counter)
+                    if group:
+                        # 🔹 특전/외전 EPUB → 부모 navPoint(예: '... IF 특전')
+                        g_idx = group["index"]
+                        if g_idx not in group_parents:
+                            parent = ET.SubElement(navMap, "navPoint", {
+                                "id": f"navPoint-{play_order}",
+                                "playOrder": str(play_order),
+                            })
+                            play_order += 1
+
+                            navLabel = ET.SubElement(parent, "navLabel")
+                            ET.SubElement(navLabel, "text").text = group["title"]
+
+                            group_parents[g_idx] = parent
+
+                        parent_navmap = group_parents[g_idx]
+                    else:
+                        # 일반 연재 화수는 그대로 최상위에 배치
+                        parent_navmap = navMap
+
+                    # 라벨 결정: 소제목 우선, 없으면 'n화'
+                    label = None
+                    if use_titles:
+                        label = self._extract_chapter_title(full_path)
+
+                    if not label:
+                        if episode_no is not None:
+                            label = f"{episode_no}화"
+                            episode_no += 1
+                        else:
+                            label = idref
+                else:
+                    # nav.xhtml, toc.ncx 등은 목차에서 제외
+                    continue
+
+                navPoint = ET.SubElement(parent_navmap, "navPoint", {
+                    "id": f"navPoint-{play_order}",
+                    "playOrder": str(play_order),
+                })
+                play_order += 1
+
+                navLabel = ET.SubElement(navPoint, "navLabel")
+                ET.SubElement(navLabel, "text").text = label
+                ET.SubElement(navPoint, "content", {"src": href_norm})
+
+            ET.ElementTree(ncx_root).write(ncx_path, encoding="utf-8", xml_declaration=True)
+            self._log(f"📌 toc.ncx 생성/갱신 완료: {ncx_path}")
+
+            # --- 5) 수정된 OPF 저장 ---
+            tree.write(base_opf, encoding="utf-8", xml_declaration=True)
+
+            # --- 6) 최종 EPUB 파일 이름 구성 및 압축 ---
+            # 전부 외전인지 확인 (이 경우 파일명에 (외전) 붙이기)
+            all_extra = all('외전' in os.path.basename(p) for p in self.epub_paths)
+
+            if range_start_no is not None and end_no is not None:
+                range_part = f"{range_start_no}-{end_no}화"
+                extra_part = " (외전)" if all_extra and "외전" not in title_core else ""
+                out_filename = f"{title_core} {range_part}{extra_part}.epub"
+            else:
+                base_name = os.path.basename(self.epub_paths[0])
+                name_no_ext, _ = os.path.splitext(base_name)
+                out_filename = f"{name_no_ext}_합본.epub"
+
+            out_path = os.path.join(out_dir, out_filename)
+            self._log(f"3/3: 최종 EPUB 압축: {out_path}")
+            self._zip_epub(base_dir, out_path)
+
+        finally:
+            try:
+                shutil.rmtree(tmp_root)
+                self._log("임시 작업 폴더 삭제 완료")
+            except Exception:
+                self._log("⚠ 임시 작업 폴더 삭제 중 오류가 발생했지만 계속 진행합니다.")
+
+        return out_path
+
+    # ---------------------- 내부 목차 유무 판별 ----------------------
+    def _epub_has_multi_nav(self, opf_path: str) -> bool:
+        """
+        주어진 OPF를 가진 EPUB 안에
+        toc.ncx(navMap/navPoint)가 2개 이상 있으면 True.
+        (기존에 자체 목차가 있는 '특전/외전 미니북' 같은 경우를 잡기 위함)
+        """
+        try:
+            opf_dir = os.path.dirname(opf_path)
+            tree = ET.parse(opf_path)
+            root = tree.getroot()
+            ns_uri = root.tag.split("}")[0].strip("{")
+            ns = {"opf": ns_uri}
+
+            manifest = root.find("opf:manifest", ns)
+            if manifest is None:
+                return False
+
+            ncx_href = None
+            for item in manifest.findall("opf:item", ns):
+                if (item.get("media-type") or "").lower() == "application/x-dtbncx+xml":
+                    ncx_href = item.get("href")
+                    break
+
+            if not ncx_href:
+                return False
+
+            ncx_path = os.path.join(opf_dir, ncx_href.replace("/", os.sep))
+            if not os.path.isfile(ncx_path):
+                return False
+
+            ncx_tree = ET.parse(ncx_path)
+            ncx_root = ncx_tree.getroot()
+            # 기본 NCX 네임스페이스
+            ns_ncx_uri = ncx_root.tag.split("}")[0].strip("{")
+            ns_ncx = {"ncx": ns_ncx_uri}
+
+            navmap = ncx_root.find("ncx:navMap", ns_ncx)
+            if navmap is None:
+                return False
+
+            navpoints = list(navmap.findall("ncx:navPoint", ns_ncx))
+            # navPoint가 2개 이상이면 '자체 목차가 있는 EPUB'로 간주
+            return len(navpoints) >= 2
+        except Exception:
+            return False
+
+    # ---------------------- 소제목 추출 헬퍼 ----------------------
+    def _extract_chapter_title(self, chapter_path: str) -> str | None:
+        """XHTML 파일에서 첫 번째 제목(h1~h6 or chapter-header)을 찾아 텍스트를 리턴."""
+        if not os.path.isfile(chapter_path):
+            return None
+        try:
+            tree = ET.parse(chapter_path)
+            root = tree.getroot()
+        except Exception:
+            return None
+
+        # 1순위: h1~h6
+        heading_tags = ("h1", "h2", "h3", "h4", "h5", "h6")
+        for elem in root.iter():
+            tag = elem.tag
+            if not isinstance(tag, str):
+                continue
+            short = tag.split("}")[-1]
+            if short in heading_tags:
+                text = "".join(elem.itertext()).strip()
+                if text:
+                    return text
+
+        # 2순위: class에 chapter-header / chapter-title 등이 들어간 요소
+        for elem in root.iter():
+            cls = elem.get("class") or ""
+            if any(key in cls for key in ("chapter-header", "chapter_title", "chapter-title")):
+                text = "".join(elem.itertext()).strip()
+                if text:
+                    return text
+
+        return None
+
+    # ---------------------- 기타 유틸들 ----------------------
+    def _extract_epub_to(self, tmp_root: str, epub_path: str) -> str:
+        name = os.path.splitext(os.path.basename(epub_path))[0]
+        out_dir = os.path.join(tmp_root, name)
+        os.makedirs(out_dir, exist_ok=True)
+        with zipfile.ZipFile(epub_path, "r") as zf:
+            zf.extractall(out_dir)
+        return out_dir
+
+    def _find_opf_path(self, root_dir: str) -> str | None:
+        for dirpath, _dirnames, filenames in os.walk(root_dir):
+            for fn in filenames:
+                if fn.lower().endswith(".opf"):
+                    return os.path.join(dirpath, fn)
+        return None
+
+    def _append_serial_chapters_from_epub(
+        self,
+        src_opf_path: str,
+        base_opf_dir: str,
+        text_dir: str,
+        base_manifest,
+        base_spine,
+        ns,
+        used_ids: set[str],
+        start_index_ref: list[int],
+    ):
+        tree = ET.parse(src_opf_path)
+        root = tree.getroot()
+        ns_uri = root.tag.split("}")[0].strip("{")
+        local_ns = {"opf": ns_uri}
+
+        manifest = root.find("opf:manifest", local_ns)
+        spine = root.find("opf:spine", local_ns)
+        if manifest is None or spine is None:
+            return
+
+        src_opf_dir = os.path.dirname(src_opf_path)
+
+        id_to_item = {}
+        for item in manifest.findall("opf:item", local_ns):
+            item_id = item.get("id", "")
+            id_to_item[item_id] = item
+
+        for itemref in spine.findall("opf:itemref", local_ns):
+            idref = itemref.get("idref", "")
+            src_item = id_to_item.get(idref)
+            if src_item is None:
+                continue
+
+            media = src_item.get("media-type", "")
+            href = src_item.get("href", "")
+            if "html" not in media:
+                continue
+
+            lower_href = href.lower()
+                # 표지/차례(nav/toc/table/book_table) 등은 본문 chapter로 취급하지 않음
+            exclude_keywords = [
+                    "cover", "nav", "toc", "ncx",
+                    "book_table", "table", "contents", "content",
+                    "차례", "목차"
+                ]
+            if any(key in lower_href for key in exclude_keywords):
+                continue
+
+            src_file = os.path.join(src_opf_dir, href)
+            if not os.path.isfile(src_file):
+                continue
+
+            chapter_index = start_index_ref[0]
+            new_id = f"chap_{chapter_index:03d}"
+            while new_id in used_ids:
+                chapter_index += 1
+                new_id = f"chap_{chapter_index:03d}"
+
+            start_index_ref[0] = chapter_index + 1
+            used_ids.add(new_id)
+
+            fname = f"chapter_{chapter_index:03d}.xhtml"
+            if text_dir:
+                new_href = f"{text_dir}/{fname}"
+            else:
+                new_href = fname
+
+            dest_file = os.path.join(base_opf_dir, new_href.replace("/", os.sep))
+            os.makedirs(os.path.dirname(dest_file), exist_ok=True)
+
+            with open(src_file, "rb") as rf, open(dest_file, "wb") as wf:
+                wf.write(rf.read())
+
+            ET.SubElement(
+                base_manifest,
+                f"{{{ns['opf']}}}item",
+                {
+                    "id": new_id,
+                    "href": new_href,
+                    "media-type": media,
+                },
+            )
+
+            ET.SubElement(
+                base_spine,
+                f"{{{ns['opf']}}}itemref",
+                {
+                    "idref": new_id,
+                },
+            )
+
+            self._log(f"  ➕ chapter {chapter_index:03d} 추가: {new_href}")
+
+    def _zip_epub(self, src_dir: str, out_path: str):
+        if os.path.exists(out_path):
+            os.remove(out_path)
+
+        with zipfile.ZipFile(out_path, "w") as zf:
+            mime_path = os.path.join(src_dir, "mimetype")
+            if os.path.isfile(mime_path):
+                zf.write(mime_path, "mimetype", compress_type=zipfile.ZIP_STORED)
+
+            for root, _dirs, files in os.walk(src_dir):
+                for fn in files:
+                    full = os.path.join(root, fn)
+                    rel = os.path.relpath(full, src_dir)
+                    if rel == "mimetype":
+                        continue
+                    zf.write(full, rel, compress_type=zipfile.ZIP_DEFLATED)
+
+    # ------------- 파일 리스트 조작 -------------
+    def _on_drop_files(self, event):
+        paths = self.window.splitlist(event.data)
+        added = 0
+        for p in paths:
+            p = p.strip()
+            if p.lower().endswith(".epub"):
+                self.epub_paths.append(p)
+                added += 1
+        if added:
+            self._maybe_resort()
+            self._refresh_list()
+
+    def _add_files(self):
+        files = filedialog.askopenfilenames(
+            title="ePub 파일 선택",
+            filetypes=[("EPUB files", "*.epub")]
+        )
+        if not files:
+            return
+        self.epub_paths.extend(files)
+        self._maybe_resort()
+        self._refresh_list()
+
+    def _remove_selected(self):
+        sel = list(self.listbox.curselection())
+        if not sel:
+            return
+        for idx in reversed(sel):
+            del self.epub_paths[idx]
+        self._refresh_list()
+
+    def _clear_all(self):
+        self.epub_paths = []
+        self._refresh_list()
+
+    def _move_up(self):
+        sel = self.listbox.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        if idx == 0:
+            return
+        self.epub_paths[idx - 1], self.epub_paths[idx] = self.epub_paths[idx], self.epub_paths[idx - 1]
+        self._refresh_list()
+        self.listbox.selection_set(idx - 1)
+
+    def _move_down(self):
+        sel = self.listbox.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        if idx >= len(self.epub_paths) - 1:
+            return
+        self.epub_paths[idx + 1], self.epub_paths[idx] = self.epub_paths[idx], self.epub_paths[idx + 1]
+        self._refresh_list()
+        self.listbox.selection_set(idx + 1)
+
+    def _maybe_resort(self):
+        if self.auto_sort_var.get():
+            self._sort_paths()
+            self._refresh_list()
+
+    def _sort_paths(self):
+        mode = self.mode_var.get()
+        if mode == "volume":
+            self.epub_paths.sort(
+                key=lambda p: _volume_sort_key_from_basename(os.path.basename(p))
+            )
+        else:
+            def num(name: str):
+                for pat in [r"\((\d+)\s*~", r"(\d+)\s*화", r"(\d+)\s*권", r"(\d+)"]:
+                    m = re.search(pat, name)
+                    if m:
+                        return int(m.group(1))
+                return None
+
+            def is_extra(name: str) -> int:
+                return 1 if re.search(r"(외전|번외|특별편|에필로그)", name) else 0
+
+            withn, without = [], []
+            for p in self.epub_paths:
+                base = os.path.basename(p)
+                n = num(base)
+                if n is None:
+                    without.append(p)
+                else:
+                    extra_flag = is_extra(base)
+                    withn.append((extra_flag, n, base, p))
+
+            withn.sort(key=lambda x: (x[0], x[1], x[2]))
+            self.epub_paths = [p for _, _, _, p in withn] + without
+
+    def _refresh_list(self):
+        self.listbox.delete(0, "end")
+        for p in self.epub_paths:
+            self.listbox.insert("end", os.path.basename(p))
+
+    # ------------- 저장 위치 -------------
+    def _choose_outdir(self):
+        d = filedialog.askdirectory(title="출력 폴더 선택", initialdir=self.last_output_dir)
+        if d:
+            self.last_output_dir = d
+            self.out_entry.delete(0, "end")
+            self.out_entry.insert(0, d)
+            try:
+                with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                    json.dump({"last_output_dir": d}, f, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
+
+    # ------------- 로그/진행바 -------------
+    def _log(self, msg: str):
+        self.log_text.insert("end", msg + "\n")
+        self.log_text.see("end")
+        self.window.update_idletasks()
+
+
+if __name__ == "__main__":
+    if DND_AVAILABLE:
+        root = TkinterDnD.Tk()
+        style = tb.Style("cosmo")
+        style.master = root
+        app = App(root, dnd_enabled=True)
+        root.mainloop()
+    else:
+        win = tb.Window(themename="cosmo")
+        app = App(win, dnd_enabled=False)
+        win.mainloop()
+# EPUB 합본 프로그램 메인 코드 (캔버스 초안)
+# 여기부터 우리가 패치 단위로 수정해 나갈 거야.
